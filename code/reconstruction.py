@@ -20,12 +20,16 @@ Design rules carried over from Phase 1 and made explicit here:
     invents a chained or inverted rate (that would duplicate/violate the
     Phase 1 `get_exchange_rate` contract).
   - "cancelled" and "failed" events never happened financially.
-    "pending" is uncertain and defaults to NOT counting yet (conservative
-    by default -- confirmed by direct message evidence in this dataset,
-    e.g. refund-pending messages explicitly saying money "has not
-    reached your account yet"). "settled" and "scheduled" count.
-    This is a classification default; Phase 3 owns whether to ever
-    override it for a specific simulation scenario.
+    "settled" and "scheduled" count. A "pending" event is direction-aware,
+    per the challenge contract: a pending DEBIT is RESERVED (counted),
+    e.g. a disputed/possible-duplicate card charge with no reversal
+    posted yet; a pending CREDIT is excluded until it settles, confirmed
+    by direct message evidence in this dataset (refund/payout/prize
+    messages explicitly saying money "has not reached your account
+    yet"). An "unrealized" investment valuation (direction == "non_cash")
+    is always excluded, regardless of status -- it is a paper value, not
+    cash. These are classification defaults; Phase 3 owns whether to ever
+    override one for a specific simulation scenario.
 """
 
 from __future__ import annotations
@@ -61,20 +65,32 @@ CLASS_NON_CASH_FLOW = "non_cash_flow"  # cancelled / failed / pending (default)
 _STATUS_COUNTS_BY_DEFAULT = {
     "settled": True,
     "scheduled": True,
-    "pending": False,
+    "pending": False,  # overridden for direction == "debit"; see _classify_status
     "cancelled": False,
     "failed": False,
+    "unrealized": False,  # investment valuation snapshots; never cash (see below)
 }
 
 _STATUS_REASON = {
     "settled": "settled events already moved money.",
     "scheduled": "scheduled events are confirmed to occur (e.g. a next-payroll salary) "
     "and are treated as a confirmed future cash flow.",
-    "pending": "pending events are not yet confirmed to have reached the account "
-    "(dataset messages describe pending refunds/payouts as not-yet-received); "
-    "excluded from cash flow by default. Phase 3 may special-case this.",
+    "pending_credit": "pending credits are not yet confirmed to have reached the account "
+    "(dataset messages describe pending refunds/payouts/prizes as not-yet-received); "
+    "excluded from cash flow until they settle, per the challenge contract "
+    "('Do not count pending credits ... until they settle').",
+    "pending_debit": "pending debits are RESERVED even though not yet settled, per the "
+    "challenge contract ('Reserve pending debits'). This includes a disputed/possible-"
+    "duplicate charge under investigation with no reversal posted yet: the financially "
+    "safer interpretation is to keep it reserved until an explicit cancellation/reversal "
+    "is confirmed.",
+    "pending_non_cash": "pending non-cash events never move cash regardless of status; excluded.",
     "cancelled": "cancelled events never completed; excluded from cash flow.",
     "failed": "failed events did not move money; excluded from cash flow.",
+    "unrealized": "unrealized investment valuation snapshots (event_type == "
+    "'investment_valuation', direction == 'non_cash') report a paper value only -- no "
+    "units were sold and no cash was generated; never counted as available cash "
+    "(explicit challenge rule: 'do not treat unrealized investment value as available cash').",
 }
 
 # A handful of category/direction bundles that recur monthly for most
@@ -197,7 +213,28 @@ def resolve_blank_amount_via_image(
 # --------------------------------------------------------------------------
 
 
-def _classify_status(status: str) -> Tuple[bool, str]:
+def _classify_status(status: str, direction: str) -> Tuple[bool, str]:
+    """Direction-aware classification. The challenge contract explicitly
+    treats a pending DEBIT differently from a pending CREDIT: "Reserve
+    pending debits. Do not count pending credits, bonuses, commissions,
+    refunds, lottery proceeds, or investment gains until they settle."
+    A plain status lookup can't express that asymmetry, so "pending" is
+    special-cased here before falling back to the direction-independent
+    table for every other status.
+    """
+    if direction == "non_cash":
+        # investment valuation snapshots and similar non-cash markers never
+        # move money, regardless of what status they carry.
+        return False, _STATUS_REASON.get(
+            status, f"non_cash direction; excluded regardless of status {status!r}"
+        )
+    if status == "pending":
+        if direction == "debit":
+            return True, _STATUS_REASON["pending_debit"]
+        if direction == "credit":
+            return False, _STATUS_REASON["pending_credit"]
+        return False, _STATUS_REASON["pending_non_cash"]
+
     counts = _STATUS_COUNTS_BY_DEFAULT.get(status)
     reason = _STATUS_REASON.get(status)
     if counts is None:
@@ -241,7 +278,7 @@ def normalize_event(
                 "left unresolved rather than guessed"
             )
 
-    counts_by_status, status_reason = _classify_status(event.status)
+    counts_by_status, status_reason = _classify_status(event.status, event.direction)
 
     if event.linked_event_id:
         classification_reason = (
@@ -440,6 +477,32 @@ def build_financial_state(ds: loaders.Dataset, user_id: str) -> Tuple[FinancialS
         for e in raw_events
         if (gap := _fx_gap_for_event(ds, e, profile.home_currency)) is not None
     ]
+
+    # Reconcile each message's own (per-message-only) 'applied' guess
+    # against what reconstruction actually used. A message evidence object
+    # doesn't know about sibling messages for the same event_id -- if two
+    # messages each named a plausible single amount for the same event but
+    # they disagreed, normalize_event() correctly left the event
+    # unresolved rather than guessing, so neither message should still
+    # claim applied=True.
+    actually_used_event_ids = {
+        e.event_id for e in final_normalized if e.amount_source == "message"
+    }
+    reconciled_evidence: List[MessageEvidence] = []
+    for ev in evidences:
+        if ev.applied and ev.related_event_id not in actually_used_event_ids:
+            reconciled_evidence.append(
+                replace(
+                    ev,
+                    applied=False,
+                    application_note=ev.application_note
+                    + "; NOT applied: reconstruction found conflicting evidence for this event "
+                    "from another message and left the amount unresolved rather than guess",
+                )
+            )
+        else:
+            reconciled_evidence.append(ev)
+    evidences = reconciled_evidence
 
     state = FinancialState(
         user_id=profile.user_id,
